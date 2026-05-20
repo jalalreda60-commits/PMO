@@ -1,0 +1,175 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main, master ]
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version label (e.g. 1.0.0)"
+        required: false
+        default: "dev"
+
+jobs:
+  build-windows-exe:
+    name: Build PMO Suite EXE (Windows)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ── Install all dependencies ───────────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── Critical: verify NumPy C-extensions load correctly ────────────────
+      # This is exactly the check that mirrors what the frozen .exe will do.
+      # If this fails here, the build would crash at runtime too.
+      - name: Verify NumPy C-extensions
+        run: |
+          python -c "
+          import numpy
+          # Force-load the C-extension that causes the crash when missing
+          import numpy.core._multiarray_umath
+          import numpy.core.multiarray
+          print('numpy version :', numpy.__version__)
+          print('numpy location:', numpy.__file__)
+          # Quick sanity check
+          import numpy as np
+          arr = np.array([1.0, 2.0, 3.0])
+          assert arr.mean() == 2.0
+          print('numpy C-extensions OK')
+          "
+
+      # ── Verify all other imports ───────────────────────────────────────────
+      - name: Smoke-test all imports
+        run: |
+          python -c "
+          import PySide6;     print('PySide6    :', PySide6.__version__)
+          import matplotlib;  print('matplotlib :', matplotlib.__version__)
+          import pandas;      print('pandas     :', pandas.__version__)
+          import openpyxl;    print('openpyxl   :', openpyxl.__version__)
+          import reportlab;   print('reportlab  :', reportlab.Version)
+          import PyInstaller; print('pyinstaller:', PyInstaller.__version__)
+
+          # Verify matplotlib internals that caused the frozen-app crash
+          import matplotlib.rcsetup
+          import matplotlib._api
+          import matplotlib._fontconfig_pattern
+          import matplotlib.cbook
+          import matplotlib.font_manager
+          # unittest must be importable (matplotlib uses it internally)
+          import unittest
+          print('matplotlib internals OK')
+          print('unittest OK')
+          print('All imports OK')
+          "
+
+      # ── Build with PyInstaller ─────────────────────────────────────────────
+      - name: Build EXE with PyInstaller
+        run: |
+          pyinstaller pmo_app.spec --noconfirm --clean
+        env:
+          PYTHONOPTIMIZE: "1"
+
+      # ── Verify the build output ────────────────────────────────────────────
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          if (Test-Path "dist/PMO_Suite/PMO_Suite.exe") {
+            Write-Host "✅ Build successful"
+            $size = (Get-Item "dist/PMO_Suite/PMO_Suite.exe").Length / 1MB
+            Write-Host ("   EXE size: {0:F1} MB" -f $size)
+
+            # Verify NumPy .pyd files are present in the bundle
+            $pydFiles = Get-ChildItem "dist/PMO_Suite" -Filter "*.pyd" -Recurse
+            $numpyPyd = $pydFiles | Where-Object { $_.Name -match "multiarray|numpy" }
+            if ($numpyPyd.Count -gt 0) {
+              Write-Host "✅ NumPy C-extensions found in bundle:"
+              $numpyPyd | ForEach-Object { Write-Host "   $($_.Name)" }
+            } else {
+              Write-Host "⚠  No numpy .pyd files found — bundle may crash on start"
+              Write-Host "   All .pyd files present:"
+              $pydFiles | ForEach-Object { Write-Host "   $($_.Name)" }
+            }
+          } else {
+            Write-Host "❌ Build FAILED — PMO_Suite.exe not found"
+            Get-ChildItem dist -Recurse | Select-Object FullName
+            exit 1
+          }
+
+      # ── Version label ──────────────────────────────────────────────────────
+      - name: Set version label
+        id: version
+        shell: pwsh
+        run: |
+          if ("${{ github.ref }}" -match "^refs/tags/v(.+)$") {
+            $ver = $Matches[1]
+          } elseif ("${{ github.event.inputs.version }}" -ne "") {
+            $ver = "${{ github.event.inputs.version }}"
+          } else {
+            $ver = "${{ github.run_number }}"
+          }
+          echo "label=$ver" >> $env:GITHUB_OUTPUT
+          Write-Host "Version label: $ver"
+
+      # ── Zip the dist folder ────────────────────────────────────────────────
+      - name: Zip dist folder
+        id: zip
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.version.outputs.label }}"
+          $zipName = "PMO_Suite_v${ver}_Windows.zip"
+          Compress-Archive -Path "dist/PMO_Suite/*" -DestinationPath $zipName
+          $size = (Get-Item $zipName).Length / 1MB
+          Write-Host ("Created: $zipName ({0:F1} MB)" -f $size)
+          echo "zip_name=$zipName" >> $env:GITHUB_OUTPUT
+
+      # ── Upload artifact (always — even on tag builds) ──────────────────────
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PMO_Suite_v${{ steps.version.outputs.label }}_Windows
+          path: PMO_Suite_v${{ steps.version.outputs.label }}_Windows.zip
+          retention-days: 30
+          if-no-files-found: error
+
+      # ── Create GitHub Release on version tags ──────────────────────────────
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "PMO Suite v${{ steps.version.outputs.label }}"
+          body: |
+            ## PMO Suite v${{ steps.version.outputs.label }}
+
+            ### Installation
+            1. Download `PMO_Suite_v${{ steps.version.outputs.label }}_Windows.zip`
+            2. Extract to any folder (e.g. `C:\PMO_Suite\`)
+            3. Double-click `PMO_Suite.exe`
+            4. Default login: **admin / admin123** — change on first login
+
+            ### System requirements
+            - Windows 10 / 11 (64-bit)
+            - No Python or any other installation required — fully self-contained
+
+            ### Data storage
+            User data and database are stored in:
+            `C:\Users\<YourName>\pmo_app_data\pmo_database.db`
+
+          files: PMO_Suite_v${{ steps.version.outputs.label }}_Windows.zip
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
